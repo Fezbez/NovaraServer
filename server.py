@@ -11,12 +11,13 @@ from typing import List, Dict, Any
 import secrets
 import ecdsa
 import base58
+import os
 
 class NovaraBlockchainServer:
     def __init__(self, socketio):
         self.chain = []
         self.pending_transactions = []
-        self.difficulty = 6  # ⚡ AUMENTATA DIFFICOLTÀ! (6 zeri)
+        self.difficulty = 4  # Difficoltà ridotta per hosting cloud
         self.mining_reward = 10
         self.transaction_fee = 0.001
         self.max_supply = 1000
@@ -39,7 +40,7 @@ class NovaraBlockchainServer:
         print(f"💰 Max Supply: {self.max_supply:,} NVR - ULTRA RARI!")
         print(f"⛏️ Total Mined: {self.total_mined:,} NVR")
         print(f"📊 Remaining: {self.max_supply - self.total_mined:,} NVR")
-        print(f"🎯 Difficulty: {self.difficulty} (MOLTO DIFFICILE!)")
+        print(f"🎯 Difficulty: {self.difficulty}")
         print(f"🔌 WebSockets: ATTIVI")
 
     def calculate_total_mined(self):
@@ -219,17 +220,13 @@ class NovaraBlockchainServer:
         return hashlib.sha256(block_string.encode()).hexdigest()
 
     def mine_block(self, block, miner_address):
-        """MINING REALE CON DIFFICOLTÀ ELEVATA - Proof of Work"""
-        target = "0" * self.difficulty  # Es: "000000" per difficulty=6
+        """MINING per hosting cloud"""
+        target = "0" * self.difficulty
         block['hash'] = self.calculate_block_hash(block)
         attempts = 0
         start_time = time.time()
-        last_update_time = start_time
         
-        print(f"⛏️ INIZIO MINING Blocco #{block['index']}")
-        print(f"🎯 Target: hash che inizia con '{target}'")
-        print(f"🔍 Difficoltà: {self.difficulty} (MOLTO ALTA)")
-        print("=" * 50)
+        print(f"⛏️ Mining block {block['index']} - Difficulty: {self.difficulty}")
         
         # Notifica inizio mining via WebSocket
         self.socketio.emit('mining_progress', {
@@ -245,14 +242,12 @@ class NovaraBlockchainServer:
             block['hash'] = self.calculate_block_hash(block)
             attempts += 1
             
-            # Aggiornamento progressi ogni secondo
-            current_time = time.time()
-            if current_time - last_update_time >= 1.0:
-                elapsed = current_time - start_time
+            # Aggiornamento ogni 5000 tentativi
+            if attempts % 5000 == 0:
+                elapsed = time.time() - start_time
                 hash_rate = attempts / elapsed if elapsed > 0 else 0
-                last_update_time = current_time
                 
-                progress_data = {
+                self.socketio.emit('mining_progress', {
                     'type': 'mining_progress',
                     'block_index': block['index'],
                     'attempts': attempts,
@@ -260,13 +255,7 @@ class NovaraBlockchainServer:
                     'hash_rate': hash_rate,
                     'current_hash': block['hash'][:16] + '...',
                     'nonce': block['nonce']
-                }
-                
-                # Stampa progressi nella console
-                print(f"⛏️ Tentativi: {attempts:,} | Hash: {block['hash'][:16]}... | Nonce: {block['nonce']:,} | Rate: {hash_rate:,.0f} H/s")
-                
-                # Invia progressi via WebSocket
-                self.socketio.emit('mining_progress', progress_data)
+                })
         
         mining_time = time.time() - start_time
         hash_rate = attempts / mining_time if mining_time > 0 else 0
@@ -278,15 +267,7 @@ class NovaraBlockchainServer:
         
         self.save_mining_stats(block['index'], mining_time, attempts, hash_rate)
         
-        print("=" * 50)
-        print(f"✅ BLOCCO #{block['index']} MINATO CON SUCCESSO!")
-        print(f"🎯 Hash trovato: {block['hash']}")
-        print(f"⛏️ Statistiche Mining:")
-        print(f"   • Tentativi totali: {attempts:,}")
-        print(f"   • Tempo impiegato: {mining_time:.2f} secondi")
-        print(f"   • Hash rate: {hash_rate:,.0f} H/s")
-        print(f"   • Nonce finale: {block['nonce']:,}")
-        print(f"   • Difficoltà: {self.difficulty}")
+        print(f"✅ Block {block['index']} mined! Attempts: {attempts:,}, Time: {mining_time:.2f}s")
         
         # Notifica completamento mining
         self.socketio.emit('mining_progress', {
@@ -451,8 +432,7 @@ class NovaraBlockchainServer:
 
     def mine_pending_transactions(self, miner_address):
         """Mining per economia ultra-rara (1000 NVR totali)"""
-        print(f"⛏️ INIZIO MINING per {miner_address}")
-        print(f"💰 Supply attuale: {self.total_mined}/1000 NVR")
+        print(f"⛏️ Mining for {miner_address} - Supply: {self.total_mined}/1000 NVR")
         
         remaining = self.max_supply - self.total_mined
         if remaining <= 0:
@@ -486,7 +466,7 @@ class NovaraBlockchainServer:
             self.chain[-1]['hash'] if self.chain else "0"
         )
         
-        # MINING REALE CON DIFFICOLTÀ
+        # MINING
         mining_time, attempts, hash_rate = self.mine_block(new_block, miner_address)
         
         # Aggiorna tempi e tentativi nel blocco
@@ -667,27 +647,21 @@ def health_check():
         'websockets_clients': len(socketio.server.manager.rooms.get('/', {}))
     }), 200
 
-def start_server(host='192.168.1.56', port=5000):
-    """Avvia il server blockchain"""
-    print(f"🚀 Starting Novara Blockchain Server on {host}:{port}")
+def start_server():
+    """Avvia il server per hosting cloud"""
+    # Prendi porta da environment variable (Render.com)
+    port = int(os.environ.get('PORT', 5000))
+    host = '0.0.0.0'  # IMPORTANTE: accetta connessioni esterne
+    
+    print(f"🚀 Starting Novara Blockchain Server on port {port}")
     print("🔌 WebSockets ATTIVI - Aggiornamenti in tempo reale!")
-    print("⛏️  MINING REALE ATTIVO - Difficoltà: 6 (MOLTO ALTA)")
-    print("📡 Available Endpoints:")
-    print(f"   GET  http://{host}:{port}/api/info")
-    print(f"   GET  http://{host}:{port}/api/chain") 
-    print(f"   POST http://{host}:{port}/api/transactions/new")
-    print(f"   POST http://{host}:{port}/api/mine")
-    print(f"   GET  http://{host}:{port}/api/balance/<address>")
-    print(f"   GET  http://{host}:{port}/api/transactions/<address>")
-    print(f"   GET  http://{host}:{port}/api/mining/stats")
-    print(f"   GET  http://{host}:{port}/api/health")
-    print(f"\n💰 Max Supply: {blockchain.max_supply} NVR - ULTRA RARI!")
+    print("⛏️  MINING ATTIVO - Difficoltà: 4")
+    print(f"💰 Max Supply: {blockchain.max_supply} NVR - ULTRA RARI!")
     print(f"⛏️ Current Supply: {blockchain.total_mined} NVR")
-    print(f"🎯 Difficulty: {blockchain.difficulty} (REALE E DIFFICILE!)")
-    print(f"💎 Mining Reward: {blockchain.mining_reward} NVR per block")
-    print(f"📊 Genesis: 100 NVR allocated to foundation")
+    print(f"🌐 Server URL: http://{host}:{port}")
+    print("📡 API disponibili su: /api/info, /api/chain, /api/transactions/new, /api/mine")
     
     socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
 
 if __name__ == '__main__':
-    start_server(host='192.168.1.56', port=5000)
+    start_server()
