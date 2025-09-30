@@ -17,9 +17,8 @@ class NovaraBlockchainServer:
     def __init__(self, socketio):
         self.chain = []
         self.pending_transactions = []
-        self.difficulty = 4  # Difficoltà ridotta per mining locale
+        self.difficulty = 4  # Difficoltà per mining
         self.mining_reward = 10
-        self.transaction_fee = 0.001
         self.max_supply = 1000
         self.total_mined = 0
         self.db_path = "novara_server.db"
@@ -44,7 +43,7 @@ class NovaraBlockchainServer:
         print(f"💰 Max Supply: {self.max_supply:,} NVR - ULTRA RARI!")
         print(f"⛏️ Total Mined: {self.total_mined:,} NVR")
         print(f"📊 Remaining: {self.max_supply - self.total_mined:,} NVR")
-        print(f"🎯 Difficulty: {self.difficulty} - MINING LOCALE!")
+        print(f"🎯 Difficulty: {self.difficulty} - MINING ATTIVO!")
         print(f"🔌 WebSockets: ATTIVI")
 
     def calculate_total_mined(self):
@@ -262,7 +261,7 @@ class NovaraBlockchainServer:
             return False, f"Signature verification failed: {e}"
 
     def add_transaction(self, transaction_data):
-        """Aggiunge transazione con verifica firma"""
+        """Aggiunge transazione con verifica firma - SENZA FEE"""
         required = ['from', 'to', 'amount', 'signature', 'public_key', 'timestamp']
         if not all(k in transaction_data for k in required):
             return False, "Missing required fields"
@@ -274,10 +273,10 @@ class NovaraBlockchainServer:
         if not is_valid:
             return False, f"Invalid transaction signature: {sig_message}"
         
+        # ✅ RIMOSSO CONTROLLO FEE
         sender_balance = self.get_balance(transaction_data['from'])
-        total_cost = transaction_data['amount'] + self.transaction_fee
-        if sender_balance < total_cost:
-            return False, f"Insufficient funds: {sender_balance} NVR available, need {total_cost} NVR"
+        if sender_balance < transaction_data['amount']:
+            return False, f"Insufficient funds: {sender_balance} NVR available, need {transaction_data['amount']} NVR"
         
         tx_id = hashlib.sha256(
             f"{transaction_data['from']}{transaction_data['to']}{transaction_data['amount']}{time.time()}".encode()
@@ -329,7 +328,7 @@ class NovaraBlockchainServer:
         conn.close()
 
     def get_balance(self, address):
-        """Calcola il balance CORRETTO per max supply 1000"""
+        """Calcola il balance - SENZA FEE"""
         balance = 0.0
         
         for block in self.chain:
@@ -337,16 +336,18 @@ class NovaraBlockchainServer:
                 if tx['to'] == address:
                     balance += tx['amount']
                 
+                # ✅ RIMOSSO SOTTRAZIONE FEE
                 if (tx['from'] == address and 
                     tx.get('type') not in ['mining_reward', 'genesis'] and
                     tx['from'] != 'NETWORK'):
-                    balance -= tx['amount'] + self.transaction_fee
+                    balance -= tx['amount']  # Solo l'importo della transazione
         
+        # ✅ RIMOSSO CONTROLLO FEE PER TRANSAZIONI PENDENTI
         for tx in self.pending_transactions:
             if (tx['from'] == address and 
                 tx.get('type') != 'mining_reward' and
                 tx['from'] != 'NETWORK'):
-                balance -= tx['amount'] + self.transaction_fee
+                balance -= tx['amount']  # Solo l'importo della transazione
         
         return round(max(0, balance), 6)
 
@@ -399,7 +400,6 @@ class NovaraBlockchainServer:
             'total_mined': self.total_mined,
             'remaining_supply': remaining_supply,
             'progress_percent': (self.total_mined / self.max_supply) * 100 if self.max_supply > 0 else 0,
-            'transaction_fee': self.transaction_fee,
             'avg_hash_rate': avg_hash_rate,
             'total_mining_attempts': self.mining_stats['total_attempts'],
             'total_mining_time': self.mining_stats['total_time'],
@@ -441,7 +441,7 @@ def get_chain():
 
 @app.route('/api/transactions/new', methods=['POST'])
 def new_transaction():
-    """Aggiunge una nuova transazione"""
+    """Aggiunge una nuova transazione - SENZA FEE"""
     values = request.get_json()
     success, message = blockchain.add_transaction(values)
     
@@ -488,8 +488,8 @@ def mine_block():
         blockchain.current_miner = None
 
 @app.route('/api/mining/start', methods=['POST'])
-def start_mining_local():
-    """Prepara il blocco per mining LOCALE sul client"""
+def start_mining():
+    """Prepara il blocco per mining"""
     values = request.get_json()
     miner_address = values.get('miner_address')
     
@@ -504,7 +504,7 @@ def start_mining_local():
     blockchain.current_miner = miner_address
     
     try:
-        # Prepara il blocco per il mining LOCALE
+        # Prepara il blocco per il mining
         valid_transactions = [tx for tx in blockchain.pending_transactions if tx['from'] != 'NETWORK']
         
         # Calcola reward
@@ -536,7 +536,7 @@ def start_mining_local():
             blockchain.chain[-1]['hash'] if blockchain.chain else "0"
         )
         
-        # Restituisce i dati per mining LOCALE
+        # Restituisce i dati per mining
         mining_data = {
             'block_data': new_block,
             'difficulty': blockchain.difficulty,
@@ -546,7 +546,7 @@ def start_mining_local():
             'previous_hash': blockchain.chain[-1]['hash'] if blockchain.chain else "0"
         }
         
-        print(f"🔧 Preparato blocco #{new_block['index']} per mining LOCALE")
+        print(f"🔧 Preparato blocco #{new_block['index']} per mining")
         return jsonify(mining_data), 200
         
     except Exception as e:
@@ -556,7 +556,7 @@ def start_mining_local():
 
 @app.route('/api/mining/submit', methods=['POST'])
 def submit_mined_block():
-    """Riceve un blocco minato localmente"""
+    """Riceve un blocco minato"""
     values = request.get_json()
     
     block_data = values.get('block_data')
@@ -656,7 +656,7 @@ def stop_mining():
 
 @app.route('/api/balance/<address>', methods=['GET'])
 def get_balance(address):
-    """Restituisce balance di un indirizzo"""
+    """Restituisce balance di un indirizzo - SENZA FEE"""
     balance = blockchain.get_balance(address)
     return jsonify({'address': address, 'balance': balance}), 200
 
@@ -706,7 +706,7 @@ def mine_block(self, block, miner_address):
     attempts = 0
     start_time = time.time()
     
-    print(f"🔥 MINING SUL SERVER - Blocco {block['index']} - Difficoltà: {self.difficulty}")
+    print(f"🔥 MINING - Blocco {block['index']} - Difficoltà: {self.difficulty}")
     
     # Notifica inizio mining via WebSocket
     self.socketio.emit('mining_progress', {
@@ -769,7 +769,7 @@ def mine_block(self, block, miner_address):
 
 def mine_pending_transactions(self, miner_address):
     """Mining sul server - Solo per compatibilità"""
-    print(f"🔥 MINING SUL SERVER per {miner_address}")
+    print(f"🔥 MINING per {miner_address}")
     
     remaining = self.max_supply - self.total_mined
     if remaining <= 0:
@@ -866,12 +866,13 @@ def start_server():
     host = '0.0.0.0'  # IMPORTANTE: accetta connessioni esterne
     
     print(f"🚀 Starting Novara Blockchain Server on port {port}")
-    print("🔥 MINING LOCALE ATTIVO - Il mining avviene sul CLIENT!")
+    print("🔥 MINING ATTIVO - Il mining avviene sul CLIENT!")
     print("🔌 WebSockets ATTIVI - Aggiornamenti in tempo reale!")
     print(f"💰 Max Supply: {blockchain.max_supply} NVR - ULTRA RARI!")
     print(f"⛏️ Current Supply: {blockchain.total_mined} NVR")
     print(f"🌐 Server URL: http://{host}:{port}")
-    print("📡 API Mining Locale: /api/mining/start, /api/mining/submit")
+    print("📡 API Mining: /api/mining/start, /api/mining/submit")
+    print("💸 TRANSAZIONI: SENZA FEE!")
     
     socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
 
