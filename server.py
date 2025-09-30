@@ -17,7 +17,7 @@ class NovaraBlockchainServer:
     def __init__(self, socketio):
         self.chain = []
         self.pending_transactions = []
-        self.difficulty = 4  # Difficoltà per mining
+        self.difficulty = 5  # 🔥 MODIFICATO: DA 4 A 5
         self.mining_reward = 10
         self.max_supply = 1000
         self.total_mined = 0
@@ -656,7 +656,7 @@ def stop_mining():
 
 @app.route('/api/balance/<address>', methods=['GET'])
 def get_balance(address):
-    """Restituisce balance di un indirizzo - SENZA FEE"""
+    """Restituisce balance di un indirizzo - SENZU FEE"""
     balance = blockchain.get_balance(address)
     return jsonify({'address': address, 'balance': balance}), 200
 
@@ -870,6 +870,7 @@ def start_server():
     print("🔌 WebSockets ATTIVI - Aggiornamenti in tempo reale!")
     print(f"💰 Max Supply: {blockchain.max_supply} NVR - ULTRA RARI!")
     print(f"⛏️ Current Supply: {blockchain.total_mined} NVR")
+    print(f"🎯 Difficulty: {blockchain.difficulty} - PERFETTO!")
     print(f"🌐 Server URL: http://{host}:{port}")
     print("📡 API Mining: /api/mining/start, /api/mining/submit")
     print("💸 TRANSAZIONI: SENZA FEE!")
