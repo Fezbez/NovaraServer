@@ -1,9 +1,9 @@
-flask==2.3.3
-flask-socketio==5.3.6
+Flask==2.3.3
 flask-cors==4.0.0
+flask-socketio==5.3.6
 python-socketio==5.10.0
+eventlet==0.33.3
 ecdsa==0.18.0
 base58==2.1.1
-requests==2.31.0
-gunicorn==21.2.0
-eventlet==0.33.3
+pymongo==4.5.0
+certifi==2023.11.17
