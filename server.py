@@ -17,7 +17,7 @@ class NovaraBlockchainServer:
     def __init__(self, socketio):
         self.chain = []
         self.pending_transactions = []
-        self.difficulty = 4  # Difficoltà ridotta per hosting cloud
+        self.difficulty = 6  # DIFFICOLTÀ AUMENTATA - MINING REALE
         self.mining_reward = 10
         self.transaction_fee = 0.001
         self.max_supply = 1000
@@ -40,7 +40,7 @@ class NovaraBlockchainServer:
         print(f"💰 Max Supply: {self.max_supply:,} NVR - ULTRA RARI!")
         print(f"⛏️ Total Mined: {self.total_mined:,} NVR")
         print(f"📊 Remaining: {self.max_supply - self.total_mined:,} NVR")
-        print(f"🎯 Difficulty: {self.difficulty}")
+        print(f"🎯 Difficulty: {self.difficulty} - MINING REALE!")
         print(f"🔌 WebSockets: ATTIVI")
 
     def calculate_total_mined(self):
@@ -220,13 +220,13 @@ class NovaraBlockchainServer:
         return hashlib.sha256(block_string.encode()).hexdigest()
 
     def mine_block(self, block, miner_address):
-        """MINING per hosting cloud"""
+        """MINING REALE con difficoltà 6"""
         target = "0" * self.difficulty
         block['hash'] = self.calculate_block_hash(block)
         attempts = 0
         start_time = time.time()
         
-        print(f"⛏️ Mining block {block['index']} - Difficulty: {self.difficulty}")
+        print(f"🔥 MINING REALE - Blocco {block['index']} - Difficoltà: {self.difficulty}")
         
         # Notifica inizio mining via WebSocket
         self.socketio.emit('mining_progress', {
@@ -242,8 +242,8 @@ class NovaraBlockchainServer:
             block['hash'] = self.calculate_block_hash(block)
             attempts += 1
             
-            # Aggiornamento ogni 5000 tentativi
-            if attempts % 5000 == 0:
+            # Aggiornamento ogni 10000 tentativi (più frequente per mining difficile)
+            if attempts % 10000 == 0:
                 elapsed = time.time() - start_time
                 hash_rate = attempts / elapsed if elapsed > 0 else 0
                 
@@ -254,7 +254,8 @@ class NovaraBlockchainServer:
                     'elapsed_time': elapsed,
                     'hash_rate': hash_rate,
                     'current_hash': block['hash'][:16] + '...',
-                    'nonce': block['nonce']
+                    'nonce': block['nonce'],
+                    'difficulty': self.difficulty
                 })
         
         mining_time = time.time() - start_time
@@ -277,7 +278,8 @@ class NovaraBlockchainServer:
             'mining_time': mining_time,
             'hash_rate': hash_rate,
             'final_hash': block['hash'],
-            'nonce': block['nonce']
+            'nonce': block['nonce'],
+            'difficulty': self.difficulty
         })
         
         return mining_time, attempts, hash_rate
@@ -431,13 +433,13 @@ class NovaraBlockchainServer:
         return round(max(0, balance), 6)
 
     def mine_pending_transactions(self, miner_address):
-        """Mining per economia ultra-rara (1000 NVR totali)"""
-        print(f"⛏️ Mining for {miner_address} - Supply: {self.total_mined}/1000 NVR")
+        """Mining per economia ultra-rara (1000 NVR totali) - VERSIONE MIGLIORATA"""
+        print(f"🔥 MINING REALE per {miner_address} - Supply: {self.total_mined}/1000 NVR")
         
         remaining = self.max_supply - self.total_mined
         if remaining <= 0:
             return False, f"🎉 TUTTI I 1000 NVR SONO STATI MINATI! Supply esaurita.", 0
-        
+    
         base_reward = self.mining_reward
         if remaining < base_reward:
             reward_amount = remaining
@@ -466,10 +468,10 @@ class NovaraBlockchainServer:
             self.chain[-1]['hash'] if self.chain else "0"
         )
         
-        # MINING
+        # MINING CON DIFFICOLTÀ REALE
+        print(f"🔥 MINING DIFFICILE ATTIVO - Difficoltà: {self.difficulty}")
         mining_time, attempts, hash_rate = self.mine_block(new_block, miner_address)
         
-        # Aggiorna tempi e tentativi nel blocco
         new_block['mining_time'] = mining_time
         new_block['attempts'] = attempts
         
@@ -478,12 +480,16 @@ class NovaraBlockchainServer:
         self.total_mined += reward_amount
         self.save_stats_to_db()
         
+        # PULISCE TRANSAZIONI PENDENTI
         self.pending_transactions = [tx for tx in self.pending_transactions if tx not in valid_transactions]
         self.clear_pending_db()
         for tx in self.pending_transactions:
             self.save_pending_transaction(tx)
         
-        # NOTIFICA WEBSOCKET
+        # CALCOLA IL NUOVO BALANCE DEL MINER
+        new_miner_balance = self.get_balance(miner_address)
+        
+        # NOTIFICA WEBSOCKET CON INFORMAZIONI AGGIUNTIVE
         self.socketio.emit('blockchain_update', {
             'type': 'new_block',
             'block_index': new_block['index'],
@@ -493,12 +499,23 @@ class NovaraBlockchainServer:
             'transactions_count': len(valid_transactions),
             'mining_time': mining_time,
             'attempts': attempts,
-            'hash_rate': hash_rate
+            'hash_rate': hash_rate,
+            'difficulty': self.difficulty
+        })
+        
+        # INVIA AGGIORNAMENTO BALANCE SPECIFICO
+        self.socketio.emit('balance_update', {
+            'miner_address': miner_address,
+            'new_balance': new_miner_balance,
+            'reward': reward_amount,
+            'block_index': new_block['index']
         })
         
         message = f"Block {new_block['index']} mined! {len(valid_transactions)} transactions + {reward_amount} NVR reward"
         message += f"\n📊 Supply: {self.total_mined}/1000 NVR ({(self.total_mined/self.max_supply)*100:.1f}%)"
         message += f"\n⛏️ Stats: {attempts:,} attempts, {mining_time:.2f}s, {hash_rate:,.0f} H/s"
+        message += f"\n🎯 Difficulty: {self.difficulty} - MINING REALE!"
+        message += f"\n💰 Miner Balance: {new_miner_balance} NVR"
         
         print(f"✅ {message}")
         return True, message, reward_amount
@@ -600,7 +617,8 @@ def mine_block():
             'block_index': len(blockchain.chain) - 1,
             'reward': reward,
             'total_mined': blockchain.total_mined,
-            'remaining_supply': blockchain.max_supply - blockchain.total_mined
+            'remaining_supply': blockchain.max_supply - blockchain.total_mined,
+            'difficulty': blockchain.difficulty
         }), 200
     else:
         return jsonify({'error': message}), 400
@@ -654,8 +672,8 @@ def start_server():
     host = '0.0.0.0'  # IMPORTANTE: accetta connessioni esterne
     
     print(f"🚀 Starting Novara Blockchain Server on port {port}")
+    print("🔥 MINING REALE ATTIVO - Difficoltà: 6")
     print("🔌 WebSockets ATTIVI - Aggiornamenti in tempo reale!")
-    print("⛏️  MINING ATTIVO - Difficoltà: 4")
     print(f"💰 Max Supply: {blockchain.max_supply} NVR - ULTRA RARI!")
     print(f"⛏️ Current Supply: {blockchain.total_mined} NVR")
     print(f"🌐 Server URL: http://{host}:{port}")
