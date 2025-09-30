@@ -12,49 +12,90 @@ import secrets
 import ecdsa
 import base58
 import os
+import atexit
+
+# MongoDB IMPORTS
+try:
+    from pymongo import MongoClient
+    import certifi
+    MONGODB_AVAILABLE = True
+except ImportError:
+    MONGODB_AVAILABLE = False
+    print("⚠️ PyMongo not available, using SQLite fallback")
+
+# EVENTLET FOR RENDER
+import eventlet
+eventlet.monkey_patch()
+
+app = Flask(__name__)
+CORS(app)
+socketio = SocketIO(
+    app, 
+    cors_allowed_origins="*", 
+    async_mode='eventlet',
+    logger=True,
+    engineio_logger=False
+)
 
 class NovaraBlockchainServer:
     def __init__(self, socketio):
         self.chain = []
         self.pending_transactions = []
-        self.difficulty = 5  # 🔥 MODIFICATO: DA 4 A 5
+        self.difficulty = 5
         self.mining_reward = 10
         self.max_supply = 1000
         self.total_mined = 0
-        self.db_path = "novara_server.db"
-        self.peers = set()
         self.socketio = socketio
-        self.mining_stats = {
-            'total_attempts': 0,
-            'total_time': 0,
-            'last_hash_rate': 0
-        }
         
-        # ✅ CONTROLLO MINING IN CORSO
+        # Mining control
         self.mining_in_progress = False
         self.current_miner = None
         
-        self.init_database()
-        if not self.load_chain_from_db():
+        # Database setup
+        self.setup_database()
+        self.load_blockchain()
+        
+        if not self.chain:
             self.create_genesis_block()
+            self.save_blockchain()
         
         self.calculate_total_mined()
-        print("✅ Novara Blockchain Server Ready!")
-        print(f"💰 Max Supply: {self.max_supply:,} NVR - ULTRA RARI!")
-        print(f"⛏️ Total Mined: {self.total_mined:,} NVR")
-        print(f"📊 Remaining: {self.max_supply - self.total_mined:,} NVR")
-        print(f"🎯 Difficulty: {self.difficulty} - MINING ATTIVO!")
-        print(f"🔌 WebSockets: ATTIVI")
+        atexit.register(self.backup_on_exit)
+        
+        print("🚀 Novara Blockchain Server Ready!")
+        print(f"💰 Total Mined: {self.total_mined}/{self.max_supply} NVR")
+        print(f"💾 Database: {'MongoDB Atlas' if self.use_mongodb else 'SQLite in Memory'}")
 
-    def calculate_total_mined(self):
-        """Calcola il totale di NVR minati"""
-        self.total_mined = 0
-        for block in self.chain:
-            for tx in block['transactions']:
-                if tx['from'] == 'NETWORK' and tx.get('type') in ['mining_reward', 'genesis']:
-                    self.total_mined += tx['amount']
+    def setup_database(self):
+        """Setup database with MongoDB priority"""
+        self.mongo_uri = os.environ.get('MONGODB_URI')
+        
+        if self.mongo_uri and MONGODB_AVAILABLE:
+            try:
+                print("🔗 Connecting to MongoDB Atlas...")
+                self.client = MongoClient(self.mongo_uri, tlsCAFile=certifi.where())
+                self.client.admin.command('ping')  # Test connection
+                
+                self.db = self.client.novara_blockchain
+                self.blocks_collection = self.db.blocks
+                self.pending_tx_collection = self.db.pending_transactions
+                self.stats_collection = self.db.stats
+                
+                self.use_mongodb = True
+                print("✅ Connected to MongoDB Atlas!")
+                return
+                
+            except Exception as e:
+                print(f"❌ MongoDB connection failed: {e}")
+        
+        # Fallback to SQLite
+        print("🔄 Using SQLite in-memory fallback")
+        self.use_mongodb = False
+        self.db_path = ":memory:"
+        self.init_sqlite_database()
 
-    def init_database(self):
+    def init_sqlite_database(self):
+        """Initialize SQLite database"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -85,31 +126,63 @@ class NovaraBlockchainServer:
             )
         ''')
         
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS blockchain_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                total_mined REAL,
-                max_supply REAL,
-                last_update REAL
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS mining_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_index INTEGER,
-                mining_time REAL,
-                attempts INTEGER,
-                hash_rate REAL,
-                difficulty INTEGER,
-                timestamp REAL
-            )
-        ''')
-        
         conn.commit()
         conn.close()
 
-    def load_chain_from_db(self):
+    def load_blockchain(self):
+        """Load blockchain from active database"""
+        if self.use_mongodb:
+            self.load_from_mongodb()
+        else:
+            self.load_from_sqlite()
+
+    def load_from_mongodb(self):
+        """Load blockchain from MongoDB"""
+        try:
+            print("📦 Loading blockchain from MongoDB...")
+            
+            # Load blocks sorted by index
+            blocks_data = list(self.blocks_collection.find().sort("index", 1))
+            self.chain = []
+            
+            for block_data in blocks_data:
+                block = {
+                    'index': block_data['index'],
+                    'transactions': block_data['transactions'],
+                    'timestamp': block_data['timestamp'],
+                    'previous_hash': block_data['previous_hash'],
+                    'hash': block_data['hash'],
+                    'nonce': block_data['nonce'],
+                    'mining_time': block_data.get('mining_time', 0),
+                    'attempts': block_data.get('attempts', 0)
+                }
+                self.chain.append(block)
+            
+            # Load pending transactions
+            pending_data = list(self.pending_tx_collection.find())
+            self.pending_transactions = []
+            
+            for tx_data in pending_data:
+                transaction = {
+                    'from': tx_data['from_address'],
+                    'to': tx_data['to_address'],
+                    'amount': tx_data['amount'],
+                    'signature': tx_data['signature'],
+                    'public_key': tx_data['public_key'],
+                    'transaction_id': tx_data['transaction_id'],
+                    'timestamp': tx_data['timestamp']
+                }
+                self.pending_transactions.append(transaction)
+            
+            print(f"✅ Loaded {len(self.chain)} blocks and {len(self.pending_transactions)} pending transactions")
+            
+        except Exception as e:
+            print(f"❌ Error loading from MongoDB: {e}")
+            self.chain = []
+            self.pending_transactions = []
+
+    def load_from_sqlite(self):
+        """Load blockchain from SQLite"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -118,7 +191,7 @@ class NovaraBlockchainServer:
             blocks_data = cursor.fetchall()
             
             if not blocks_data:
-                return False
+                return
             
             for block_data in blocks_data:
                 block = {
@@ -147,46 +220,142 @@ class NovaraBlockchainServer:
                     'timestamp': tx[7]
                 })
             
-            cursor.execute('SELECT * FROM blockchain_stats WHERE id = 1')
-            stats = cursor.fetchone()
-            if stats:
-                self.total_mined = stats[1] or 0
-            
             conn.close()
-            print(f"📦 Blockchain caricata: {len(self.chain)} blocchi, {len(self.pending_transactions)} transazioni pendenti")
-            return True
+            print(f"📦 SQLite: {len(self.chain)} blocks, {len(self.pending_transactions)} pending transactions")
+            
         except Exception as e:
-            print(f"❌ Error loading chain: {e}")
-            return False
+            print(f"❌ Error loading from SQLite: {e}")
 
-    def save_stats_to_db(self):
-        """Salva le statistiche nel database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT OR REPLACE INTO blockchain_stats (id, total_mined, max_supply, last_update)
-            VALUES (1, ?, ?, ?)
-        ''', (self.total_mined, self.max_supply, time.time()))
-        
-        conn.commit()
-        conn.close()
+    def save_blockchain(self):
+        """Save blockchain to active database"""
+        if self.use_mongodb:
+            self.save_to_mongodb()
+        else:
+            self.save_to_sqlite()
 
-    def save_mining_stats(self, block_index, mining_time, attempts, hash_rate):
-        """Salva statistiche mining"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO mining_stats (block_index, mining_time, attempts, hash_rate, difficulty, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (block_index, mining_time, attempts, hash_rate, self.difficulty, time.time()))
-        
-        conn.commit()
-        conn.close()
+    def save_to_mongodb(self):
+        """Save blockchain to MongoDB"""
+        try:
+            # Save blocks
+            if self.chain:
+                self.blocks_collection.delete_many({})
+                
+                blocks_to_insert = []
+                for block in self.chain:
+                    block_data = {
+                        'index': block['index'],
+                        'transactions': block['transactions'],
+                        'timestamp': block['timestamp'],
+                        'previous_hash': block['previous_hash'],
+                        'hash': block['hash'],
+                        'nonce': block['nonce'],
+                        'mining_time': block.get('mining_time', 0),
+                        'attempts': block.get('attempts', 0),
+                        'last_updated': datetime.now().isoformat()
+                    }
+                    blocks_to_insert.append(block_data)
+                
+                self.blocks_collection.insert_many(blocks_to_insert)
+            
+            # Save pending transactions
+            if self.pending_transactions:
+                self.pending_tx_collection.delete_many({})
+                
+                pending_to_insert = []
+                for tx in self.pending_transactions:
+                    tx_data = {
+                        'from_address': tx['from'],
+                        'to_address': tx['to'],
+                        'amount': tx['amount'],
+                        'signature': tx['signature'],
+                        'public_key': tx['public_key'],
+                        'transaction_id': tx['transaction_id'],
+                        'timestamp': tx['timestamp'],
+                        'last_updated': datetime.now().isoformat()
+                    }
+                    pending_to_insert.append(tx_data)
+                
+                self.pending_tx_collection.insert_many(pending_to_insert)
+            
+            # Save stats
+            self.stats_collection.delete_many({})
+            self.stats_collection.insert_one({
+                'total_mined': self.total_mined,
+                'max_supply': self.max_supply,
+                'last_update': datetime.now().isoformat(),
+                'chain_length': len(self.chain),
+                'pending_count': len(self.pending_transactions)
+            })
+            
+            print("💾 Blockchain saved to MongoDB Atlas")
+            
+        except Exception as e:
+            print(f"❌ Error saving to MongoDB: {e}")
+
+    def save_to_sqlite(self):
+        """Save blockchain to SQLite"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Clear tables
+            cursor.execute('DELETE FROM blocks')
+            cursor.execute('DELETE FROM pending_transactions')
+            
+            # Save blocks
+            for block in self.chain:
+                cursor.execute('''
+                    INSERT INTO blocks (block_index, transactions, timestamp, previous_hash, hash, nonce, mining_time, attempts)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    block['index'],
+                    json.dumps(block['transactions']),
+                    block['timestamp'],
+                    block['previous_hash'],
+                    block['hash'],
+                    block['nonce'],
+                    block.get('mining_time', 0),
+                    block.get('attempts', 0)
+                ))
+            
+            # Save pending transactions
+            for tx in self.pending_transactions:
+                cursor.execute('''
+                    INSERT INTO pending_transactions (from_address, to_address, amount, signature, public_key, transaction_id, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    tx['from'],
+                    tx['to'],
+                    tx['amount'],
+                    tx['signature'],
+                    tx['public_key'],
+                    tx['transaction_id'],
+                    tx['timestamp']
+                ))
+            
+            conn.commit()
+            conn.close()
+            
+            print("💾 Blockchain saved to SQLite")
+            
+        except Exception as e:
+            print(f"❌ Error saving to SQLite: {e}")
+
+    def backup_on_exit(self):
+        """Automatic backup on exit"""
+        print("💾 Automatic blockchain backup...")
+        self.save_blockchain()
+
+    def calculate_total_mined(self):
+        """Calculate total NVR mined"""
+        self.total_mined = 0
+        for block in self.chain:
+            for tx in block['transactions']:
+                if tx['from'] == 'NETWORK' and tx.get('type') in ['mining_reward', 'genesis']:
+                    self.total_mined += tx['amount']
 
     def create_genesis_block(self):
-        """Crea il blocco genesis con 100 NVR per la foundation"""
+        """Create genesis block with 100 NVR for foundation"""
         genesis_tx = {
             'transaction_id': 'genesis_novara',
             'from': 'NETWORK',
@@ -203,7 +372,6 @@ class NovaraBlockchainServer:
         self.chain.append(genesis_block)
         self.save_block_to_db(genesis_block)
         self.total_mined += 100
-        self.save_stats_to_db()
         print("🎉 Genesis Block Created with 100 NVR!")
 
     def create_block(self, index, transactions, timestamp, previous_hash):
@@ -223,7 +391,7 @@ class NovaraBlockchainServer:
         return hashlib.sha256(block_string.encode()).hexdigest()
 
     def generate_bitcoin_address(self, public_key_bytes):
-        """Genera indirizzo Bitcoin-style dalla public key"""
+        """Generate Bitcoin-style address from public key"""
         sha256_hash = hashlib.sha256(public_key_bytes).digest()
         
         ripemd160 = hashlib.new('ripemd160')
@@ -237,7 +405,7 @@ class NovaraBlockchainServer:
         return base58.b58encode(binary_address).decode('ascii')
 
     def verify_transaction_signature(self, transaction_data):
-        """Verifica la firma ECDSA della transazione"""
+        """Verify ECDSA transaction signature"""
         try:
             message = f"{transaction_data['from']}{transaction_data['to']}{transaction_data['amount']}{transaction_data['timestamp']}"
             
@@ -260,8 +428,58 @@ class NovaraBlockchainServer:
         except Exception as e:
             return False, f"Signature verification failed: {e}"
 
+    def get_balance(self, address):
+        """Calculate balance - ONLY from confirmed transactions"""
+        balance = 0.0
+        
+        print(f"🔍 Calculating balance for: {address}")
+        
+        # ONLY confirmed transactions in blocks
+        for block_index, block in enumerate(self.chain):
+            for tx_index, tx in enumerate(block['transactions']):
+                # DEBUG: Log relevant transactions
+                if tx['to'] == address or tx['from'] == address:
+                    print(f"   Block {block_index}, TX {tx_index}: {tx['from'][:8]}... → {tx['to'][:8]}... : {tx['amount']} NVR")
+                
+                # Add if you are recipient
+                if tx['to'] == address:
+                    balance += tx['amount']
+                    print(f"   +{tx['amount']} NVR (received)")
+                
+                # Subtract only if you are sender AND not a reward
+                if (tx['from'] == address and 
+                    tx.get('type') not in ['mining_reward', 'genesis'] and
+                    tx['from'] != 'NETWORK'):
+                    balance -= tx['amount']
+                    print(f"   -{tx['amount']} NVR (sent)")
+        
+        print(f"💰 Final balance for {address}: {balance} NVR")
+        
+        return round(max(0, balance), 6)
+
+    def get_effective_balance(self, address):
+        """Balance for transaction validation (includes pending outgoing)"""
+        confirmed_balance = self.get_balance(address)
+        
+        # Calculate pending outgoing transactions
+        pending_outgoing = 0
+        for tx in self.pending_transactions:
+            if tx['from'] == address:
+                pending_outgoing += tx['amount']
+                print(f"⚠️ Pending transaction: -{tx['amount']} NVR waiting confirmation")
+        
+        effective_balance = max(0, confirmed_balance - pending_outgoing)
+        print(f"🎯 Effective balance for {address}: {effective_balance} NVR (confirmed: {confirmed_balance} NVR)")
+        
+        return effective_balance
+
     def add_transaction(self, transaction_data):
-        """Aggiunge transazione con verifica firma - SENZA FEE"""
+        """Add transaction with signature verification - NO FEES"""
+        print(f"🎯 New transaction received:")
+        print(f"   From: {transaction_data['from']}")
+        print(f"   To: {transaction_data['to']}")
+        print(f"   Amount: {transaction_data['amount']} NVR")
+        
         required = ['from', 'to', 'amount', 'signature', 'public_key', 'timestamp']
         if not all(k in transaction_data for k in required):
             return False, "Missing required fields"
@@ -269,15 +487,21 @@ class NovaraBlockchainServer:
         if transaction_data['amount'] <= 0:
             return False, "Invalid amount"
         
+        # Verify ECDSA signature
         is_valid, sig_message = self.verify_transaction_signature(transaction_data)
         if not is_valid:
             return False, f"Invalid transaction signature: {sig_message}"
         
-        # ✅ RIMOSSO CONTROLLO FEE
-        sender_balance = self.get_balance(transaction_data['from'])
-        if sender_balance < transaction_data['amount']:
-            return False, f"Insufficient funds: {sender_balance} NVR available, need {transaction_data['amount']} NVR"
+        # Check sender balance
+        sender_balance = self.get_effective_balance(transaction_data['from'])
+        print(f"   Sender available balance: {sender_balance} NVR")
         
+        if sender_balance < transaction_data['amount']:
+            error_msg = f"Insufficient funds: {sender_balance} NVR available, need {transaction_data['amount']} NVR"
+            print(f"❌ {error_msg}")
+            return False, error_msg
+        
+        # Generate transaction ID
         tx_id = hashlib.sha256(
             f"{transaction_data['from']}{transaction_data['to']}{transaction_data['amount']}{time.time()}".encode()
         ).hexdigest()
@@ -295,7 +519,7 @@ class NovaraBlockchainServer:
         self.pending_transactions.append(transaction)
         self.save_pending_transaction(transaction)
         
-        # NOTIFICA WEBSOCKET
+        # WebSocket notification
         self.socketio.emit('blockchain_update', {
             'type': 'new_transaction',
             'from': transaction_data['from'][:8] + '...',
@@ -304,10 +528,31 @@ class NovaraBlockchainServer:
             'transaction_id': tx_id
         })
         
-        print(f"✅ Transazione verificata: {tx_id} - {transaction_data['amount']} NVR")
+        print(f"✅ Transaction verified: {tx_id}")
         return True, f"Transaction added: {tx_id}"
 
     def save_pending_transaction(self, transaction):
+        """Save pending transaction to database"""
+        if self.use_mongodb:
+            try:
+                tx_data = {
+                    'from_address': transaction['from'],
+                    'to_address': transaction['to'],
+                    'amount': transaction['amount'],
+                    'signature': transaction['signature'],
+                    'public_key': transaction['public_key'],
+                    'transaction_id': transaction['transaction_id'],
+                    'timestamp': transaction['timestamp'],
+                    'created_at': datetime.now().isoformat()
+                }
+                self.pending_tx_collection.insert_one(tx_data)
+            except Exception as e:
+                print(f"❌ Error saving transaction to MongoDB: {e}")
+        else:
+            self.save_pending_transaction_sqlite(transaction)
+
+    def save_pending_transaction_sqlite(self, transaction):
+        """Save pending transaction to SQLite"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -327,31 +572,29 @@ class NovaraBlockchainServer:
         conn.commit()
         conn.close()
 
-    def get_balance(self, address):
-        """Calcola il balance - SENZA FEE"""
-        balance = 0.0
-        
-        for block in self.chain:
-            for tx in block['transactions']:
-                if tx['to'] == address:
-                    balance += tx['amount']
-                
-                # ✅ RIMOSSO SOTTRAZIONE FEE
-                if (tx['from'] == address and 
-                    tx.get('type') not in ['mining_reward', 'genesis'] and
-                    tx['from'] != 'NETWORK'):
-                    balance -= tx['amount']  # Solo l'importo della transazione
-        
-        # ✅ RIMOSSO CONTROLLO FEE PER TRANSAZIONI PENDENTI
-        for tx in self.pending_transactions:
-            if (tx['from'] == address and 
-                tx.get('type') != 'mining_reward' and
-                tx['from'] != 'NETWORK'):
-                balance -= tx['amount']  # Solo l'importo della transazione
-        
-        return round(max(0, balance), 6)
-
     def save_block_to_db(self, block):
+        """Save single block to database"""
+        if self.use_mongodb:
+            try:
+                block_data = {
+                    'index': block['index'],
+                    'transactions': block['transactions'],
+                    'timestamp': block['timestamp'],
+                    'previous_hash': block['previous_hash'],
+                    'hash': block['hash'],
+                    'nonce': block['nonce'],
+                    'mining_time': block.get('mining_time', 0),
+                    'attempts': block.get('attempts', 0),
+                    'created_at': datetime.now().isoformat()
+                }
+                self.blocks_collection.insert_one(block_data)
+            except Exception as e:
+                print(f"❌ Error saving block to MongoDB: {e}")
+        else:
+            self.save_block_to_sqlite(block)
+
+    def save_block_to_sqlite(self, block):
+        """Save block to SQLite"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -373,20 +616,32 @@ class NovaraBlockchainServer:
         conn.close()
 
     def clear_pending_db(self):
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('DELETE FROM pending_transactions')
-        conn.commit()
-        conn.close()
+        """Clear pending transactions from database"""
+        if self.use_mongodb:
+            try:
+                self.pending_tx_collection.delete_many({})
+            except Exception as e:
+                print(f"❌ Error clearing pending transactions from MongoDB: {e}")
+        else:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM pending_transactions')
+            conn.commit()
+            conn.close()
 
     def get_blockchain_info(self):
+        """Get blockchain information"""
         valid_pending = len([tx for tx in self.pending_transactions if tx['from'] != 'NETWORK'])
         remaining_supply = max(0, self.max_supply - self.total_mined)
         
-        # Calcola hash rate medio
+        # Calculate average hash rate
         avg_hash_rate = 0
-        if self.mining_stats['total_time'] > 0:
-            avg_hash_rate = self.mining_stats['total_attempts'] / self.mining_stats['total_time']
+        mining_blocks = [b for b in self.chain if b.get('mining_time', 0) > 0]
+        if mining_blocks:
+            total_attempts = sum(b.get('attempts', 0) for b in mining_blocks)
+            total_time = sum(b.get('mining_time', 0) for b in mining_blocks)
+            if total_time > 0:
+                avg_hash_rate = total_attempts / total_time
         
         return {
             'chain_length': len(self.chain),
@@ -401,39 +656,53 @@ class NovaraBlockchainServer:
             'remaining_supply': remaining_supply,
             'progress_percent': (self.total_mined / self.max_supply) * 100 if self.max_supply > 0 else 0,
             'avg_hash_rate': avg_hash_rate,
-            'total_mining_attempts': self.mining_stats['total_attempts'],
-            'total_mining_time': self.mining_stats['total_time'],
+            'total_mining_attempts': sum(b.get('attempts', 0) for b in self.chain),
+            'total_mining_time': sum(b.get('mining_time', 0) for b in self.chain),
             'mining_in_progress': self.mining_in_progress,
-            'current_miner': self.current_miner
+            'current_miner': self.current_miner,
+            'database_type': 'mongodb' if self.use_mongodb else 'sqlite'
         }
 
-# Inizializza Flask App
-app = Flask(__name__)
-CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+# Initialize blockchain
 blockchain = NovaraBlockchainServer(socketio)
 
 # WebSocket Events
 @socketio.on('connect')
 def handle_connect():
     print(f"🔌 Client WebSocket connected: {request.sid}")
-    emit('blockchain_update', {'type': 'connected', 'message': 'Benvenuto su Novara Coin!'})
+    emit('blockchain_update', {'type': 'connected', 'message': 'Welcome to Novara Coin!'})
 
 @socketio.on('disconnect')
 def handle_disconnect():
     print(f"❌ Client WebSocket disconnected: {request.sid}")
 
-# === API ROUTES ===
+# API ROUTES
+@app.route('/')
+def home():
+    """Home page with API information"""
+    return jsonify({
+        'message': 'Novara Coin Blockchain API',
+        'version': '1.0',
+        'database': 'MongoDB Atlas' if blockchain.use_mongodb else 'SQLite in Memory',
+        'endpoints': {
+            'GET /api/info': 'Blockchain information',
+            'GET /api/chain': 'Full blockchain',
+            'POST /api/transactions/new': 'Create new transaction',
+            'GET /api/balance/<address>': 'Get address balance',
+            'GET /api/transactions/<address>': 'Get address transactions',
+            'GET /health': 'Health check'
+        }
+    })
 
 @app.route('/api/info', methods=['GET'])
 def get_info():
-    """Restituisce info blockchain"""
+    """Get blockchain info"""
     info = blockchain.get_blockchain_info()
     return jsonify(info), 200
 
 @app.route('/api/chain', methods=['GET'])
 def get_chain():
-    """Restituisce l'intera blockchain"""
+    """Get full blockchain"""
     return jsonify({
         'chain': blockchain.chain,
         'length': len(blockchain.chain)
@@ -441,7 +710,7 @@ def get_chain():
 
 @app.route('/api/transactions/new', methods=['POST'])
 def new_transaction():
-    """Aggiunge una nuova transazione - SENZA FEE"""
+    """Add new transaction - NO FEES"""
     values = request.get_json()
     success, message = blockchain.add_transaction(values)
     
@@ -453,216 +722,15 @@ def new_transaction():
     else:
         return jsonify({'error': message}), 400
 
-@app.route('/api/mine', methods=['POST'])
-def mine_block():
-    """MINING SUL SERVER - Solo per compatibilità"""
-    values = request.get_json()
-    miner_address = values.get('miner_address', 'anonymous_miner')
-    
-    if not miner_address or miner_address == 'anonymous_miner':
-        return jsonify({'error': 'Please provide a valid miner address'}), 400
-    
-    # ✅ CONTROLLO MINING IN CORSO
-    if blockchain.mining_in_progress:
-        return jsonify({'error': '⛏️ Mining già in corso. Attendi il completamento.'}), 400
-    
-    blockchain.mining_in_progress = True
-    blockchain.current_miner = miner_address
-    
-    try:
-        success, message, reward = blockchain.mine_pending_transactions(miner_address)
-        
-        if success:
-            return jsonify({
-                'message': message,
-                'block_index': len(blockchain.chain) - 1,
-                'reward': reward,
-                'total_mined': blockchain.total_mined,
-                'remaining_supply': blockchain.max_supply - blockchain.total_mined,
-                'difficulty': blockchain.difficulty
-            }), 200
-        else:
-            return jsonify({'error': message}), 400
-    finally:
-        blockchain.mining_in_progress = False
-        blockchain.current_miner = None
-
-@app.route('/api/mining/start', methods=['POST'])
-def start_mining():
-    """Prepara il blocco per mining"""
-    values = request.get_json()
-    miner_address = values.get('miner_address')
-    
-    if not miner_address:
-        return jsonify({'error': 'Miner address required'}), 400
-    
-    # ✅ CONTROLLO MINING IN CORSO
-    if blockchain.mining_in_progress:
-        return jsonify({'error': '⛏️ Mining già in corso. Attendi il completamento.'}), 400
-    
-    blockchain.mining_in_progress = True
-    blockchain.current_miner = miner_address
-    
-    try:
-        # Prepara il blocco per il mining
-        valid_transactions = [tx for tx in blockchain.pending_transactions if tx['from'] != 'NETWORK']
-        
-        # Calcola reward
-        remaining = blockchain.max_supply - blockchain.total_mined
-        if remaining <= 0:
-            blockchain.mining_in_progress = False
-            blockchain.current_miner = None
-            return jsonify({'error': '🎉 Supply esaurito! Tutti i 1000 NVR sono stati minati.'}), 400
-        
-        reward_amount = min(blockchain.mining_reward, remaining)
-        
-        reward_tx = {
-            'transaction_id': f"reward_{int(time.time())}_{secrets.token_hex(4)}",
-            'from': 'NETWORK', 
-            'to': miner_address,
-            'amount': reward_amount,
-            'signature': 'mining_reward',
-            'public_key': 'mining_reward', 
-            'timestamp': time.time(),
-            'type': 'mining_reward'
-        }
-        
-        transactions_to_mine = valid_transactions + [reward_tx]
-        
-        new_block = blockchain.create_block(
-            len(blockchain.chain),
-            transactions_to_mine,
-            time.time(),
-            blockchain.chain[-1]['hash'] if blockchain.chain else "0"
-        )
-        
-        # Restituisce i dati per mining
-        mining_data = {
-            'block_data': new_block,
-            'difficulty': blockchain.difficulty,
-            'target': "0" * blockchain.difficulty,
-            'miner_address': miner_address,
-            'reward': reward_amount,
-            'previous_hash': blockchain.chain[-1]['hash'] if blockchain.chain else "0"
-        }
-        
-        print(f"🔧 Preparato blocco #{new_block['index']} per mining")
-        return jsonify(mining_data), 200
-        
-    except Exception as e:
-        blockchain.mining_in_progress = False
-        blockchain.current_miner = None
-        return jsonify({'error': f'Errore preparazione mining: {e}'}), 500
-
-@app.route('/api/mining/submit', methods=['POST'])
-def submit_mined_block():
-    """Riceve un blocco minato"""
-    values = request.get_json()
-    
-    block_data = values.get('block_data')
-    miner_address = values.get('miner_address')
-    attempts = values.get('attempts', 0)
-    mining_time = values.get('mining_time', 0)
-    hash_rate = values.get('hash_rate', 0)
-    
-    if not block_data or not miner_address:
-        return jsonify({'error': 'Dati blocco mancanti'}), 400
-    
-    try:
-        # Verifica che l'hash sia valido
-        block_hash = blockchain.calculate_block_hash(block_data)
-        if block_hash[:blockchain.difficulty] != "0" * blockchain.difficulty:
-            return jsonify({'error': 'Proof of Work non valido'}), 400
-        
-        # Verifica che il previous_hash sia corretto
-        if block_data['previous_hash'] != blockchain.chain[-1]['hash']:
-            return jsonify({'error': 'Blockchain modificata durante il mining'}), 400
-        
-        # Aggiungi il blocco alla blockchain
-        block_data['mining_time'] = mining_time
-        block_data['attempts'] = attempts
-        block_data['hash'] = block_hash
-        
-        blockchain.chain.append(block_data)
-        blockchain.save_block_to_db(block_data)
-        
-        # Aggiorna supply e balance
-        blockchain.total_mined += values.get('reward', 0)
-        blockchain.save_stats_to_db()
-        
-        # Salva statistiche mining
-        blockchain.save_mining_stats(block_data['index'], mining_time, attempts, hash_rate)
-        blockchain.mining_stats['total_attempts'] += attempts
-        blockchain.mining_stats['total_time'] += mining_time
-        blockchain.mining_stats['last_hash_rate'] = hash_rate
-        
-        # Pulisci transazioni pendenti
-        valid_transactions = [tx for tx in block_data['transactions'] if tx['from'] != 'NETWORK']
-        blockchain.pending_transactions = [tx for tx in blockchain.pending_transactions if tx not in valid_transactions]
-        blockchain.clear_pending_db()
-        for tx in blockchain.pending_transactions:
-            blockchain.save_pending_transaction(tx)
-        
-        # Calcola nuovo balance del miner
-        new_miner_balance = blockchain.get_balance(miner_address)
-        
-        # Notifica tutti i client
-        blockchain.socketio.emit('blockchain_update', {
-            'type': 'new_block',
-            'block_index': block_data['index'],
-            'miner': miner_address,
-            'reward': values.get('reward', 0),
-            'total_mined': blockchain.total_mined,
-            'transactions_count': len(valid_transactions),
-            'mining_time': mining_time,
-            'attempts': attempts,
-            'hash_rate': hash_rate,
-            'difficulty': blockchain.difficulty
-        })
-        
-        # Invia aggiornamento balance specifico
-        blockchain.socketio.emit('balance_update', {
-            'miner_address': miner_address,
-            'new_balance': new_miner_balance,
-            'reward': values.get('reward', 0),
-            'block_index': block_data['index']
-        })
-        
-        message = f"✅ Blocco #{block_data['index']} minato con successo! {len(valid_transactions)} transazioni + {values.get('reward', 0)} NVR reward"
-        print(message)
-        
-        return jsonify({
-            'message': message,
-            'block_index': block_data['index'],
-            'reward': values.get('reward', 0),
-            'new_balance': new_miner_balance
-        }), 200
-        
-    except Exception as e:
-        return jsonify({'error': f'Errore submit blocco: {e}'}), 500
-    finally:
-        blockchain.mining_in_progress = False
-        blockchain.current_miner = None
-
-@app.route('/api/mining/stop', methods=['POST'])
-def stop_mining():
-    """Ferma il mining in corso"""
-    if blockchain.mining_in_progress:
-        blockchain.mining_in_progress = False
-        blockchain.current_miner = None
-        return jsonify({'message': '⏹️ Mining fermato'}), 200
-    else:
-        return jsonify({'message': 'Nessun mining in corso'}), 200
-
 @app.route('/api/balance/<address>', methods=['GET'])
 def get_balance(address):
-    """Restituisce balance di un indirizzo - SENZU FEE"""
+    """Get address balance - NO FEES"""
     balance = blockchain.get_balance(address)
     return jsonify({'address': address, 'balance': balance}), 200
 
 @app.route('/api/transactions/<address>', methods=['GET'])
 def get_address_transactions(address):
-    """Restituisce tutte le transazioni di un indirizzo"""
+    """Get all transactions for an address"""
     transactions = []
     
     for block in blockchain.chain:
@@ -676,206 +744,53 @@ def get_address_transactions(address):
     
     return jsonify({'address': address, 'transactions': transactions}), 200
 
-@app.route('/api/mining/stats', methods=['GET'])
-def get_mining_stats():
-    """Restituisce statistiche mining"""
-    stats = blockchain.get_blockchain_info()
-    return jsonify(stats), 200
-
-@app.route('/api/health', methods=['GET'])
+@app.route('/health', methods=['GET'])
 def health_check():
-    """Health check del server"""
+    """Health check for Render"""
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
         'blockchain_length': len(blockchain.chain),
         'total_mined': blockchain.total_mined,
         'max_supply': blockchain.max_supply,
-        'remaining_supply': blockchain.max_supply - blockchain.total_mined,
-        'difficulty': blockchain.difficulty,
-        'mining_in_progress': blockchain.mining_in_progress,
-        'current_miner': blockchain.current_miner,
-        'websockets_clients': len(socketio.server.manager.rooms.get('/', {}))
+        'database': 'mongodb' if blockchain.use_mongodb else 'sqlite',
+        'pending_transactions': len(blockchain.pending_transactions)
     }), 200
 
-# === MINING SUL SERVER (per compatibilità) ===
-def mine_block(self, block, miner_address):
-    """MINING SUL SERVER - Solo per compatibilità"""
-    target = "0" * self.difficulty
-    block['hash'] = self.calculate_block_hash(block)
-    attempts = 0
-    start_time = time.time()
-    
-    print(f"🔥 MINING - Blocco {block['index']} - Difficoltà: {self.difficulty}")
-    
-    # Notifica inizio mining via WebSocket
-    self.socketio.emit('mining_progress', {
-        'type': 'mining_started',
-        'block_index': block['index'],
-        'miner': miner_address,
-        'difficulty': self.difficulty,
-        'target': target
-    })
-    
-    while block['hash'][:self.difficulty] != target and self.mining_in_progress:
-        block['nonce'] += 1
-        block['hash'] = self.calculate_block_hash(block)
-        attempts += 1
-        
-        # Aggiornamento ogni 10000 tentativi
-        if attempts % 10000 == 0:
-            elapsed = time.time() - start_time
-            hash_rate = attempts / elapsed if elapsed > 0 else 0
-            
-            self.socketio.emit('mining_progress', {
-                'type': 'mining_progress',
-                'block_index': block['index'],
-                'attempts': attempts,
-                'elapsed_time': elapsed,
-                'hash_rate': hash_rate,
-                'current_hash': block['hash'][:16] + '...',
-                'nonce': block['nonce'],
-                'difficulty': self.difficulty
-            })
-    
-    if not self.mining_in_progress:
-        return 0, 0, 0  # Mining fermato
-    
-    mining_time = time.time() - start_time
-    hash_rate = attempts / mining_time if mining_time > 0 else 0
-    
-    # Salva statistiche
-    self.mining_stats['total_attempts'] += attempts
-    self.mining_stats['total_time'] += mining_time
-    self.mining_stats['last_hash_rate'] = hash_rate
-    
-    self.save_mining_stats(block['index'], mining_time, attempts, hash_rate)
-    
-    print(f"✅ Block {block['index']} mined! Attempts: {attempts:,}, Time: {mining_time:.2f}s")
-    
-    # Notifica completamento mining
-    self.socketio.emit('mining_progress', {
-        'type': 'mining_completed',
-        'block_index': block['index'],
-        'attempts': attempts,
-        'mining_time': mining_time,
-        'hash_rate': hash_rate,
-        'final_hash': block['hash'],
-        'nonce': block['nonce'],
-        'difficulty': self.difficulty
-    })
-    
-    return mining_time, attempts, hash_rate
+# Error handlers
+@socketio.on_error_default
+def default_error_handler(e):
+    """Default WebSocket error handler"""
+    print(f"WebSocket error: {e}")
+    return {"error": "Internal server error"}
 
-def mine_pending_transactions(self, miner_address):
-    """Mining sul server - Solo per compatibilità"""
-    print(f"🔥 MINING per {miner_address}")
-    
-    remaining = self.max_supply - self.total_mined
-    if remaining <= 0:
-        return False, "🎉 TUTTI I 1000 NVR SONO STATI MINATI! Supply esaurita.", 0
-    
-    base_reward = self.mining_reward
-    if remaining < base_reward:
-        reward_amount = remaining
-    else:
-        reward_amount = base_reward
-    
-    valid_transactions = [tx for tx in self.pending_transactions if tx['from'] != 'NETWORK']
-    
-    reward_tx = {
-        'transaction_id': f"reward_{int(time.time())}_{secrets.token_hex(4)}",
-        'from': 'NETWORK', 
-        'to': miner_address,
-        'amount': reward_amount,
-        'signature': 'mining_reward',
-        'public_key': 'mining_reward',
-        'timestamp': time.time(),
-        'type': 'mining_reward'
-    }
-    
-    transactions_to_mine = valid_transactions + [reward_tx]
-    
-    new_block = self.create_block(
-        len(self.chain),
-        transactions_to_mine, 
-        time.time(),
-        self.chain[-1]['hash'] if self.chain else "0"
-    )
-    
-    # MINING SUL SERVER
-    mining_time, attempts, hash_rate = self.mine_block(new_block, miner_address)
-    
-    if attempts == 0:  # Mining fermato
-        return False, "Mining fermato dall'utente", 0
-    
-    new_block['mining_time'] = mining_time
-    new_block['attempts'] = attempts
-    
-    self.chain.append(new_block)
-    self.save_block_to_db(new_block)
-    self.total_mined += reward_amount
-    self.save_stats_to_db()
-    
-    # Pulisce transazioni pendenti
-    self.pending_transactions = [tx for tx in self.pending_transactions if tx not in valid_transactions]
-    self.clear_pending_db()
-    for tx in self.pending_transactions:
-        self.save_pending_transaction(tx)
-    
-    # Calcola il nuovo balance del miner
-    new_miner_balance = self.get_balance(miner_address)
-    
-    # Notifica WebSocket
-    self.socketio.emit('blockchain_update', {
-        'type': 'new_block',
-        'block_index': new_block['index'],
-        'miner': miner_address,
-        'reward': reward_amount,
-        'total_mined': self.total_mined,
-        'transactions_count': len(valid_transactions),
-        'mining_time': mining_time,
-        'attempts': attempts,
-        'hash_rate': hash_rate,
-        'difficulty': self.difficulty
-    })
-    
-    # Invia aggiornamento balance specifico
-    self.socketio.emit('balance_update', {
-        'miner_address': miner_address,
-        'new_balance': new_miner_balance,
-        'reward': reward_amount,
-        'block_index': new_block['index']
-    })
-    
-    message = f"Block {new_block['index']} mined! {len(valid_transactions)} transactions + {reward_amount} NVR reward"
-    message += f"\n📊 Supply: {self.total_mined}/1000 NVR ({(self.total_mined/self.max_supply)*100:.1f}%)"
-    message += f"\n⛏️ Stats: {attempts:,} attempts, {mining_time:.2f}s, {hash_rate:,.0f} H/s"
-    
-    print(f"✅ {message}")
-    return True, message, reward_amount
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Endpoint not found'}), 404
 
-# Aggiungi i metodi alla classe
-NovaraBlockchainServer.mine_block = mine_block
-NovaraBlockchainServer.mine_pending_transactions = mine_pending_transactions
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'Internal server error'}), 500
 
 def start_server():
-    """Avvia il server per hosting cloud"""
-    # Prendi porta da environment variable (Render.com)
+    """Start server for Render.com"""
     port = int(os.environ.get('PORT', 5000))
-    host = '0.0.0.0'  # IMPORTANTE: accetta connessioni esterne
+    host = '0.0.0.0'
     
     print(f"🚀 Starting Novara Blockchain Server on port {port}")
-    print("🔥 MINING ATTIVO - Il mining avviene sul CLIENT!")
-    print("🔌 WebSockets ATTIVI - Aggiornamenti in tempo reale!")
-    print(f"💰 Max Supply: {blockchain.max_supply} NVR - ULTRA RARI!")
-    print(f"⛏️ Current Supply: {blockchain.total_mined} NVR")
-    print(f"🎯 Difficulty: {blockchain.difficulty} - PERFETTO!")
     print(f"🌐 Server URL: http://{host}:{port}")
-    print("📡 API Mining: /api/mining/start, /api/mining/submit")
-    print("💸 TRANSAZIONI: SENZA FEE!")
+    print(f"💾 Database: {'MongoDB Atlas' if blockchain.use_mongodb else 'SQLite in Memory'}")
+    print("🔌 WebSockets: ACTIVE")
+    print("💰 Novara Coin - PERSISTENT Blockchain!")
     
-    socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
+    socketio.run(
+        app,
+        host=host,
+        port=port,
+        debug=False,
+        log_output=True,
+        allow_unsafe_werkzeug=True
+    )
 
 if __name__ == '__main__':
     start_server()
