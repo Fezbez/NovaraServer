@@ -17,7 +17,7 @@ class NovaraBlockchainServer:
     def __init__(self, socketio):
         self.chain = []
         self.pending_transactions = []
-        self.difficulty = 6  # DIFFICOLTÀ AUMENTATA - MINING REALE
+        self.difficulty = 4  # Difficoltà ridotta per mining locale
         self.mining_reward = 10
         self.transaction_fee = 0.001
         self.max_supply = 1000
@@ -31,6 +31,10 @@ class NovaraBlockchainServer:
             'last_hash_rate': 0
         }
         
+        # ✅ CONTROLLO MINING IN CORSO
+        self.mining_in_progress = False
+        self.current_miner = None
+        
         self.init_database()
         if not self.load_chain_from_db():
             self.create_genesis_block()
@@ -40,7 +44,7 @@ class NovaraBlockchainServer:
         print(f"💰 Max Supply: {self.max_supply:,} NVR - ULTRA RARI!")
         print(f"⛏️ Total Mined: {self.total_mined:,} NVR")
         print(f"📊 Remaining: {self.max_supply - self.total_mined:,} NVR")
-        print(f"🎯 Difficulty: {self.difficulty} - MINING REALE!")
+        print(f"🎯 Difficulty: {self.difficulty} - MINING LOCALE!")
         print(f"🔌 WebSockets: ATTIVI")
 
     def calculate_total_mined(self):
@@ -219,92 +223,6 @@ class NovaraBlockchainServer:
         block_string = f"{block['index']}{json.dumps(block['transactions'], sort_keys=True)}{block['timestamp']}{block['previous_hash']}{block['nonce']}"
         return hashlib.sha256(block_string.encode()).hexdigest()
 
-    def mine_block(self, block, miner_address):
-        """MINING REALE con difficoltà 6"""
-        target = "0" * self.difficulty
-        block['hash'] = self.calculate_block_hash(block)
-        attempts = 0
-        start_time = time.time()
-        
-        print(f"🔥 MINING REALE - Blocco {block['index']} - Difficoltà: {self.difficulty}")
-        
-        # Notifica inizio mining via WebSocket
-        self.socketio.emit('mining_progress', {
-            'type': 'mining_started',
-            'block_index': block['index'],
-            'miner': miner_address,
-            'difficulty': self.difficulty,
-            'target': target
-        })
-        
-        while block['hash'][:self.difficulty] != target:
-            block['nonce'] += 1
-            block['hash'] = self.calculate_block_hash(block)
-            attempts += 1
-            
-            # Aggiornamento ogni 10000 tentativi (più frequente per mining difficile)
-            if attempts % 10000 == 0:
-                elapsed = time.time() - start_time
-                hash_rate = attempts / elapsed if elapsed > 0 else 0
-                
-                self.socketio.emit('mining_progress', {
-                    'type': 'mining_progress',
-                    'block_index': block['index'],
-                    'attempts': attempts,
-                    'elapsed_time': elapsed,
-                    'hash_rate': hash_rate,
-                    'current_hash': block['hash'][:16] + '...',
-                    'nonce': block['nonce'],
-                    'difficulty': self.difficulty
-                })
-        
-        mining_time = time.time() - start_time
-        hash_rate = attempts / mining_time if mining_time > 0 else 0
-        
-        # Salva statistiche
-        self.mining_stats['total_attempts'] += attempts
-        self.mining_stats['total_time'] += mining_time
-        self.mining_stats['last_hash_rate'] = hash_rate
-        
-        self.save_mining_stats(block['index'], mining_time, attempts, hash_rate)
-        
-        print(f"✅ Block {block['index']} mined! Attempts: {attempts:,}, Time: {mining_time:.2f}s")
-        
-        # Notifica completamento mining
-        self.socketio.emit('mining_progress', {
-            'type': 'mining_completed',
-            'block_index': block['index'],
-            'attempts': attempts,
-            'mining_time': mining_time,
-            'hash_rate': hash_rate,
-            'final_hash': block['hash'],
-            'nonce': block['nonce'],
-            'difficulty': self.difficulty
-        })
-        
-        return mining_time, attempts, hash_rate
-
-    def save_block_to_db(self, block):
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO blocks (block_index, transactions, timestamp, previous_hash, hash, nonce, mining_time, attempts)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            block['index'],
-            json.dumps(block['transactions']),
-            block['timestamp'],
-            block['previous_hash'],
-            block['hash'],
-            block['nonce'],
-            block.get('mining_time', 0),
-            block.get('attempts', 0)
-        ))
-        
-        conn.commit()
-        conn.close()
-
     def generate_bitcoin_address(self, public_key_bytes):
         """Genera indirizzo Bitcoin-style dalla public key"""
         sha256_hash = hashlib.sha256(public_key_bytes).digest()
@@ -432,93 +350,26 @@ class NovaraBlockchainServer:
         
         return round(max(0, balance), 6)
 
-    def mine_pending_transactions(self, miner_address):
-        """Mining per economia ultra-rara (1000 NVR totali) - VERSIONE MIGLIORATA"""
-        print(f"🔥 MINING REALE per {miner_address} - Supply: {self.total_mined}/1000 NVR")
+    def save_block_to_db(self, block):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
         
-        remaining = self.max_supply - self.total_mined
-        if remaining <= 0:
-            return False, f"🎉 TUTTI I 1000 NVR SONO STATI MINATI! Supply esaurita.", 0
-    
-        base_reward = self.mining_reward
-        if remaining < base_reward:
-            reward_amount = remaining
-        else:
-            reward_amount = base_reward
+        cursor.execute('''
+            INSERT INTO blocks (block_index, transactions, timestamp, previous_hash, hash, nonce, mining_time, attempts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            block['index'],
+            json.dumps(block['transactions']),
+            block['timestamp'],
+            block['previous_hash'],
+            block['hash'],
+            block['nonce'],
+            block.get('mining_time', 0),
+            block.get('attempts', 0)
+        ))
         
-        valid_transactions = [tx for tx in self.pending_transactions if tx['from'] != 'NETWORK']
-        
-        reward_tx = {
-            'transaction_id': f"reward_{int(time.time())}_{secrets.token_hex(4)}",
-            'from': 'NETWORK', 
-            'to': miner_address,
-            'amount': reward_amount,
-            'signature': 'mining_reward',
-            'public_key': 'mining_reward',
-            'timestamp': time.time(),
-            'type': 'mining_reward'
-        }
-        
-        transactions_to_mine = valid_transactions + [reward_tx]
-        
-        new_block = self.create_block(
-            len(self.chain),
-            transactions_to_mine, 
-            time.time(),
-            self.chain[-1]['hash'] if self.chain else "0"
-        )
-        
-        # MINING CON DIFFICOLTÀ REALE
-        print(f"🔥 MINING DIFFICILE ATTIVO - Difficoltà: {self.difficulty}")
-        mining_time, attempts, hash_rate = self.mine_block(new_block, miner_address)
-        
-        new_block['mining_time'] = mining_time
-        new_block['attempts'] = attempts
-        
-        self.chain.append(new_block)
-        self.save_block_to_db(new_block)
-        self.total_mined += reward_amount
-        self.save_stats_to_db()
-        
-        # PULISCE TRANSAZIONI PENDENTI
-        self.pending_transactions = [tx for tx in self.pending_transactions if tx not in valid_transactions]
-        self.clear_pending_db()
-        for tx in self.pending_transactions:
-            self.save_pending_transaction(tx)
-        
-        # CALCOLA IL NUOVO BALANCE DEL MINER
-        new_miner_balance = self.get_balance(miner_address)
-        
-        # NOTIFICA WEBSOCKET CON INFORMAZIONI AGGIUNTIVE
-        self.socketio.emit('blockchain_update', {
-            'type': 'new_block',
-            'block_index': new_block['index'],
-            'miner': miner_address,
-            'reward': reward_amount,
-            'total_mined': self.total_mined,
-            'transactions_count': len(valid_transactions),
-            'mining_time': mining_time,
-            'attempts': attempts,
-            'hash_rate': hash_rate,
-            'difficulty': self.difficulty
-        })
-        
-        # INVIA AGGIORNAMENTO BALANCE SPECIFICO
-        self.socketio.emit('balance_update', {
-            'miner_address': miner_address,
-            'new_balance': new_miner_balance,
-            'reward': reward_amount,
-            'block_index': new_block['index']
-        })
-        
-        message = f"Block {new_block['index']} mined! {len(valid_transactions)} transactions + {reward_amount} NVR reward"
-        message += f"\n📊 Supply: {self.total_mined}/1000 NVR ({(self.total_mined/self.max_supply)*100:.1f}%)"
-        message += f"\n⛏️ Stats: {attempts:,} attempts, {mining_time:.2f}s, {hash_rate:,.0f} H/s"
-        message += f"\n🎯 Difficulty: {self.difficulty} - MINING REALE!"
-        message += f"\n💰 Miner Balance: {new_miner_balance} NVR"
-        
-        print(f"✅ {message}")
-        return True, message, reward_amount
+        conn.commit()
+        conn.close()
 
     def clear_pending_db(self):
         conn = sqlite3.connect(self.db_path)
@@ -551,7 +402,9 @@ class NovaraBlockchainServer:
             'transaction_fee': self.transaction_fee,
             'avg_hash_rate': avg_hash_rate,
             'total_mining_attempts': self.mining_stats['total_attempts'],
-            'total_mining_time': self.mining_stats['total_time']
+            'total_mining_time': self.mining_stats['total_time'],
+            'mining_in_progress': self.mining_in_progress,
+            'current_miner': self.current_miner
         }
 
 # Inizializza Flask App
@@ -602,26 +455,204 @@ def new_transaction():
 
 @app.route('/api/mine', methods=['POST'])
 def mine_block():
-    """Mina un nuovo blocco"""
+    """MINING SUL SERVER - Solo per compatibilità"""
     values = request.get_json()
     miner_address = values.get('miner_address', 'anonymous_miner')
     
     if not miner_address or miner_address == 'anonymous_miner':
         return jsonify({'error': 'Please provide a valid miner address'}), 400
     
-    success, message, reward = blockchain.mine_pending_transactions(miner_address)
+    # ✅ CONTROLLO MINING IN CORSO
+    if blockchain.mining_in_progress:
+        return jsonify({'error': '⛏️ Mining già in corso. Attendi il completamento.'}), 400
     
-    if success:
+    blockchain.mining_in_progress = True
+    blockchain.current_miner = miner_address
+    
+    try:
+        success, message, reward = blockchain.mine_pending_transactions(miner_address)
+        
+        if success:
+            return jsonify({
+                'message': message,
+                'block_index': len(blockchain.chain) - 1,
+                'reward': reward,
+                'total_mined': blockchain.total_mined,
+                'remaining_supply': blockchain.max_supply - blockchain.total_mined,
+                'difficulty': blockchain.difficulty
+            }), 200
+        else:
+            return jsonify({'error': message}), 400
+    finally:
+        blockchain.mining_in_progress = False
+        blockchain.current_miner = None
+
+@app.route('/api/mining/start', methods=['POST'])
+def start_mining_local():
+    """Prepara il blocco per mining LOCALE sul client"""
+    values = request.get_json()
+    miner_address = values.get('miner_address')
+    
+    if not miner_address:
+        return jsonify({'error': 'Miner address required'}), 400
+    
+    # ✅ CONTROLLO MINING IN CORSO
+    if blockchain.mining_in_progress:
+        return jsonify({'error': '⛏️ Mining già in corso. Attendi il completamento.'}), 400
+    
+    blockchain.mining_in_progress = True
+    blockchain.current_miner = miner_address
+    
+    try:
+        # Prepara il blocco per il mining LOCALE
+        valid_transactions = [tx for tx in blockchain.pending_transactions if tx['from'] != 'NETWORK']
+        
+        # Calcola reward
+        remaining = blockchain.max_supply - blockchain.total_mined
+        if remaining <= 0:
+            blockchain.mining_in_progress = False
+            blockchain.current_miner = None
+            return jsonify({'error': '🎉 Supply esaurito! Tutti i 1000 NVR sono stati minati.'}), 400
+        
+        reward_amount = min(blockchain.mining_reward, remaining)
+        
+        reward_tx = {
+            'transaction_id': f"reward_{int(time.time())}_{secrets.token_hex(4)}",
+            'from': 'NETWORK', 
+            'to': miner_address,
+            'amount': reward_amount,
+            'signature': 'mining_reward',
+            'public_key': 'mining_reward', 
+            'timestamp': time.time(),
+            'type': 'mining_reward'
+        }
+        
+        transactions_to_mine = valid_transactions + [reward_tx]
+        
+        new_block = blockchain.create_block(
+            len(blockchain.chain),
+            transactions_to_mine,
+            time.time(),
+            blockchain.chain[-1]['hash'] if blockchain.chain else "0"
+        )
+        
+        # Restituisce i dati per mining LOCALE
+        mining_data = {
+            'block_data': new_block,
+            'difficulty': blockchain.difficulty,
+            'target': "0" * blockchain.difficulty,
+            'miner_address': miner_address,
+            'reward': reward_amount,
+            'previous_hash': blockchain.chain[-1]['hash'] if blockchain.chain else "0"
+        }
+        
+        print(f"🔧 Preparato blocco #{new_block['index']} per mining LOCALE")
+        return jsonify(mining_data), 200
+        
+    except Exception as e:
+        blockchain.mining_in_progress = False
+        blockchain.current_miner = None
+        return jsonify({'error': f'Errore preparazione mining: {e}'}), 500
+
+@app.route('/api/mining/submit', methods=['POST'])
+def submit_mined_block():
+    """Riceve un blocco minato localmente"""
+    values = request.get_json()
+    
+    block_data = values.get('block_data')
+    miner_address = values.get('miner_address')
+    attempts = values.get('attempts', 0)
+    mining_time = values.get('mining_time', 0)
+    hash_rate = values.get('hash_rate', 0)
+    
+    if not block_data or not miner_address:
+        return jsonify({'error': 'Dati blocco mancanti'}), 400
+    
+    try:
+        # Verifica che l'hash sia valido
+        block_hash = blockchain.calculate_block_hash(block_data)
+        if block_hash[:blockchain.difficulty] != "0" * blockchain.difficulty:
+            return jsonify({'error': 'Proof of Work non valido'}), 400
+        
+        # Verifica che il previous_hash sia corretto
+        if block_data['previous_hash'] != blockchain.chain[-1]['hash']:
+            return jsonify({'error': 'Blockchain modificata durante il mining'}), 400
+        
+        # Aggiungi il blocco alla blockchain
+        block_data['mining_time'] = mining_time
+        block_data['attempts'] = attempts
+        block_data['hash'] = block_hash
+        
+        blockchain.chain.append(block_data)
+        blockchain.save_block_to_db(block_data)
+        
+        # Aggiorna supply e balance
+        blockchain.total_mined += values.get('reward', 0)
+        blockchain.save_stats_to_db()
+        
+        # Salva statistiche mining
+        blockchain.save_mining_stats(block_data['index'], mining_time, attempts, hash_rate)
+        blockchain.mining_stats['total_attempts'] += attempts
+        blockchain.mining_stats['total_time'] += mining_time
+        blockchain.mining_stats['last_hash_rate'] = hash_rate
+        
+        # Pulisci transazioni pendenti
+        valid_transactions = [tx for tx in block_data['transactions'] if tx['from'] != 'NETWORK']
+        blockchain.pending_transactions = [tx for tx in blockchain.pending_transactions if tx not in valid_transactions]
+        blockchain.clear_pending_db()
+        for tx in blockchain.pending_transactions:
+            blockchain.save_pending_transaction(tx)
+        
+        # Calcola nuovo balance del miner
+        new_miner_balance = blockchain.get_balance(miner_address)
+        
+        # Notifica tutti i client
+        blockchain.socketio.emit('blockchain_update', {
+            'type': 'new_block',
+            'block_index': block_data['index'],
+            'miner': miner_address,
+            'reward': values.get('reward', 0),
+            'total_mined': blockchain.total_mined,
+            'transactions_count': len(valid_transactions),
+            'mining_time': mining_time,
+            'attempts': attempts,
+            'hash_rate': hash_rate,
+            'difficulty': blockchain.difficulty
+        })
+        
+        # Invia aggiornamento balance specifico
+        blockchain.socketio.emit('balance_update', {
+            'miner_address': miner_address,
+            'new_balance': new_miner_balance,
+            'reward': values.get('reward', 0),
+            'block_index': block_data['index']
+        })
+        
+        message = f"✅ Blocco #{block_data['index']} minato con successo! {len(valid_transactions)} transazioni + {values.get('reward', 0)} NVR reward"
+        print(message)
+        
         return jsonify({
             'message': message,
-            'block_index': len(blockchain.chain) - 1,
-            'reward': reward,
-            'total_mined': blockchain.total_mined,
-            'remaining_supply': blockchain.max_supply - blockchain.total_mined,
-            'difficulty': blockchain.difficulty
+            'block_index': block_data['index'],
+            'reward': values.get('reward', 0),
+            'new_balance': new_miner_balance
         }), 200
+        
+    except Exception as e:
+        return jsonify({'error': f'Errore submit blocco: {e}'}), 500
+    finally:
+        blockchain.mining_in_progress = False
+        blockchain.current_miner = None
+
+@app.route('/api/mining/stop', methods=['POST'])
+def stop_mining():
+    """Ferma il mining in corso"""
+    if blockchain.mining_in_progress:
+        blockchain.mining_in_progress = False
+        blockchain.current_miner = None
+        return jsonify({'message': '⏹️ Mining fermato'}), 200
     else:
-        return jsonify({'error': message}), 400
+        return jsonify({'message': 'Nessun mining in corso'}), 200
 
 @app.route('/api/balance/<address>', methods=['GET'])
 def get_balance(address):
@@ -662,8 +693,171 @@ def health_check():
         'max_supply': blockchain.max_supply,
         'remaining_supply': blockchain.max_supply - blockchain.total_mined,
         'difficulty': blockchain.difficulty,
+        'mining_in_progress': blockchain.mining_in_progress,
+        'current_miner': blockchain.current_miner,
         'websockets_clients': len(socketio.server.manager.rooms.get('/', {}))
     }), 200
+
+# === MINING SUL SERVER (per compatibilità) ===
+def mine_block(self, block, miner_address):
+    """MINING SUL SERVER - Solo per compatibilità"""
+    target = "0" * self.difficulty
+    block['hash'] = self.calculate_block_hash(block)
+    attempts = 0
+    start_time = time.time()
+    
+    print(f"🔥 MINING SUL SERVER - Blocco {block['index']} - Difficoltà: {self.difficulty}")
+    
+    # Notifica inizio mining via WebSocket
+    self.socketio.emit('mining_progress', {
+        'type': 'mining_started',
+        'block_index': block['index'],
+        'miner': miner_address,
+        'difficulty': self.difficulty,
+        'target': target
+    })
+    
+    while block['hash'][:self.difficulty] != target and self.mining_in_progress:
+        block['nonce'] += 1
+        block['hash'] = self.calculate_block_hash(block)
+        attempts += 1
+        
+        # Aggiornamento ogni 10000 tentativi
+        if attempts % 10000 == 0:
+            elapsed = time.time() - start_time
+            hash_rate = attempts / elapsed if elapsed > 0 else 0
+            
+            self.socketio.emit('mining_progress', {
+                'type': 'mining_progress',
+                'block_index': block['index'],
+                'attempts': attempts,
+                'elapsed_time': elapsed,
+                'hash_rate': hash_rate,
+                'current_hash': block['hash'][:16] + '...',
+                'nonce': block['nonce'],
+                'difficulty': self.difficulty
+            })
+    
+    if not self.mining_in_progress:
+        return 0, 0, 0  # Mining fermato
+    
+    mining_time = time.time() - start_time
+    hash_rate = attempts / mining_time if mining_time > 0 else 0
+    
+    # Salva statistiche
+    self.mining_stats['total_attempts'] += attempts
+    self.mining_stats['total_time'] += mining_time
+    self.mining_stats['last_hash_rate'] = hash_rate
+    
+    self.save_mining_stats(block['index'], mining_time, attempts, hash_rate)
+    
+    print(f"✅ Block {block['index']} mined! Attempts: {attempts:,}, Time: {mining_time:.2f}s")
+    
+    # Notifica completamento mining
+    self.socketio.emit('mining_progress', {
+        'type': 'mining_completed',
+        'block_index': block['index'],
+        'attempts': attempts,
+        'mining_time': mining_time,
+        'hash_rate': hash_rate,
+        'final_hash': block['hash'],
+        'nonce': block['nonce'],
+        'difficulty': self.difficulty
+    })
+    
+    return mining_time, attempts, hash_rate
+
+def mine_pending_transactions(self, miner_address):
+    """Mining sul server - Solo per compatibilità"""
+    print(f"🔥 MINING SUL SERVER per {miner_address}")
+    
+    remaining = self.max_supply - self.total_mined
+    if remaining <= 0:
+        return False, "🎉 TUTTI I 1000 NVR SONO STATI MINATI! Supply esaurita.", 0
+    
+    base_reward = self.mining_reward
+    if remaining < base_reward:
+        reward_amount = remaining
+    else:
+        reward_amount = base_reward
+    
+    valid_transactions = [tx for tx in self.pending_transactions if tx['from'] != 'NETWORK']
+    
+    reward_tx = {
+        'transaction_id': f"reward_{int(time.time())}_{secrets.token_hex(4)}",
+        'from': 'NETWORK', 
+        'to': miner_address,
+        'amount': reward_amount,
+        'signature': 'mining_reward',
+        'public_key': 'mining_reward',
+        'timestamp': time.time(),
+        'type': 'mining_reward'
+    }
+    
+    transactions_to_mine = valid_transactions + [reward_tx]
+    
+    new_block = self.create_block(
+        len(self.chain),
+        transactions_to_mine, 
+        time.time(),
+        self.chain[-1]['hash'] if self.chain else "0"
+    )
+    
+    # MINING SUL SERVER
+    mining_time, attempts, hash_rate = self.mine_block(new_block, miner_address)
+    
+    if attempts == 0:  # Mining fermato
+        return False, "Mining fermato dall'utente", 0
+    
+    new_block['mining_time'] = mining_time
+    new_block['attempts'] = attempts
+    
+    self.chain.append(new_block)
+    self.save_block_to_db(new_block)
+    self.total_mined += reward_amount
+    self.save_stats_to_db()
+    
+    # Pulisce transazioni pendenti
+    self.pending_transactions = [tx for tx in self.pending_transactions if tx not in valid_transactions]
+    self.clear_pending_db()
+    for tx in self.pending_transactions:
+        self.save_pending_transaction(tx)
+    
+    # Calcola il nuovo balance del miner
+    new_miner_balance = self.get_balance(miner_address)
+    
+    # Notifica WebSocket
+    self.socketio.emit('blockchain_update', {
+        'type': 'new_block',
+        'block_index': new_block['index'],
+        'miner': miner_address,
+        'reward': reward_amount,
+        'total_mined': self.total_mined,
+        'transactions_count': len(valid_transactions),
+        'mining_time': mining_time,
+        'attempts': attempts,
+        'hash_rate': hash_rate,
+        'difficulty': self.difficulty
+    })
+    
+    # Invia aggiornamento balance specifico
+    self.socketio.emit('balance_update', {
+        'miner_address': miner_address,
+        'new_balance': new_miner_balance,
+        'reward': reward_amount,
+        'block_index': new_block['index']
+    })
+    
+    message = f"Block {new_block['index']} mined! {len(valid_transactions)} transactions + {reward_amount} NVR reward"
+    message += f"\n📊 Supply: {self.total_mined}/1000 NVR ({(self.total_mined/self.max_supply)*100:.1f}%)"
+    message += f"\n⛏️ Stats: {attempts:,} attempts, {mining_time:.2f}s, {hash_rate:,.0f} H/s"
+    
+    print(f"✅ {message}")
+    return True, message, reward_amount
+
+# Aggiungi i metodi alla classe
+NovaraBlockchainServer.mine_block = mine_block
+NovaraBlockchainServer.mine_pending_transactions = mine_pending_transactions
 
 def start_server():
     """Avvia il server per hosting cloud"""
@@ -672,12 +866,12 @@ def start_server():
     host = '0.0.0.0'  # IMPORTANTE: accetta connessioni esterne
     
     print(f"🚀 Starting Novara Blockchain Server on port {port}")
-    print("🔥 MINING REALE ATTIVO - Difficoltà: 6")
+    print("🔥 MINING LOCALE ATTIVO - Il mining avviene sul CLIENT!")
     print("🔌 WebSockets ATTIVI - Aggiornamenti in tempo reale!")
     print(f"💰 Max Supply: {blockchain.max_supply} NVR - ULTRA RARI!")
     print(f"⛏️ Current Supply: {blockchain.total_mined} NVR")
     print(f"🌐 Server URL: http://{host}:{port}")
-    print("📡 API disponibili su: /api/info, /api/chain, /api/transactions/new, /api/mine")
+    print("📡 API Mining Locale: /api/mining/start, /api/mining/submit")
     
     socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
 
